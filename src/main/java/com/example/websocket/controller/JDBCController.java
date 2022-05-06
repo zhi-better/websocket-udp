@@ -15,10 +15,12 @@ import java.util.Map;
 public class JDBCController {
     @Autowired
     private JdbcTemplate jdbcTemplate;
-
-    private static HashMap<Integer, Session> mHashMapUser = new HashMap<>();
-    private static HashMap<Integer, Session> mHashMapDevs = new HashMap<>();
     private Integer numOnlineConnections = 0;
+
+    public void ResetAllUserState(){
+        String sql = "UPDATE users SET users.onlinestate = 0;";
+        jdbcTemplate.execute(sql);
+    }
 
     //是否具有设备控制权限
     public Boolean hasPermission(Integer userid, Integer devid){
@@ -55,16 +57,6 @@ public class JDBCController {
         mapSend.put("devid",id.toString());
         mapSend.put("devname",name);
         return mapSend.toString();
-    }
-
-    //获取当前在线人数
-    public Integer GetOnlineUserNum(){
-        return mHashMapUser.size();
-    }
-
-    //获取当前在线人数
-    public Integer GetOnlineDevNum(){
-        return mHashMapDevs.size();
     }
 
     //增加在线设备数量
@@ -117,29 +109,12 @@ public class JDBCController {
         return "{cmd=removeresp,msg=ok,devid="+devid+",devname="+devname+",devpassword="+pwd+"}";
     }
 
-    //通过 id 获取对应用户的 session
-    public Session GetUserSession(Integer id){
-        return mHashMapUser.get(id);
-    }
-
-    //通过 id 获取对应设备的 session
-    public Session GetDevSession(Integer id){
-        return mHashMapDevs.get(id);
-    }
-
     //设备登陆
-    public List<Map<String, Object>> DevLogin(Integer id, String pwd, Session session){
+    public List<Map<String, Object>> DevLogin(Integer id, String pwd){
         String sql = "SELECT devs.devid,devs.devname FROM devs WHERE devid = "
                 + id + " and devpassword=\'" + pwd + "\';";
 
         List<Map<String, Object>> maps = jdbcTemplate.queryForList(sql);
-        if (!maps.isEmpty()) {
-            //增加对应的登陆信息
-            if (mHashMapDevs.containsKey(id)){
-                mHashMapDevs.remove(id);
-            }
-            mHashMapDevs.put(id, session);   //保存对应的 id 和 session 的关系
-        }
         return maps;
     }
 
@@ -153,7 +128,6 @@ public class JDBCController {
             //保存对应的 id 和 session
             sql = "update users set users.onlinestate=1 where userid="+id;
             jdbcTemplate.update(sql);
-            mHashMapUser.put(id, session);   //保存对应的 id 和 session 的关系
         }
         return maps;
     }
@@ -174,36 +148,17 @@ public class JDBCController {
         return jdbcTemplate.queryForList(sql);
     }
 
-    //获取设备的在线状态
-    public Boolean GetDevState(Integer id){
-        return mHashMapDevs.containsKey(id);
-    }
-
-    //获取用户在线状态
-    public Boolean GetUserState(Integer id){
-        return mHashMapUser.containsKey(id);
-    }
-
     //设置用户的在线状态，防止数据库更新不及时或者未更新导致数据不匹配
     public void SetSQLUserState(Integer id, Boolean state){
         String sql = "update users set users.onlinestate="+state+" where userid="+id+";";
         jdbcTemplate.update(sql);
     }
 
-    //下线设备，更新状态
-    public void DevOffLine(Integer id){
-        if (mHashMapDevs.containsKey(id)){
-            mHashMapDevs.remove(id);
-        }
-    }
-
     //下线用户
     public void UserOffLine(Integer id) {
-        if (mHashMapUser.containsKey(id)){
-        mHashMapUser.remove(id);
         String sql = "update users set users.onlinestate=0 where userid="+id;
         jdbcTemplate.update(sql);
-    }}
+    }
 
     @RequestMapping("/userList")
     public List<Map<String, Object>> userList(){

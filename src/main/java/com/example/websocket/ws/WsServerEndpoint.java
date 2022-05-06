@@ -29,10 +29,11 @@ public class WsServerEndpoint {
 
     private static HashMap<Integer, Session> mHashMapUser =
             new HashMap<>();   //用于 userid 和 session 的关系保存
-    private static HashMap<Integer, List<Session>> mHashMapDevUserOnlineList =
-            new HashMap<>();    //用于设备 userid 和对应的在线用户关系保存
     private static HashMap<Integer, UnicastSendingMessageHandler> mHashMapDevs =
             new HashMap<>();    //用于 userid 和 udpsend... 的关系保存
+    private static HashMap<Integer, List<Session>> mHashMapDevUserOnlineList =
+            new HashMap<>();    //用于设备 devid 和对应的在线用户关系保存
+
     private static JDBCController jdbcController;       //用于数据库操作
 
     //部分非静态私有变量
@@ -43,6 +44,13 @@ public class WsServerEndpoint {
     @Autowired
     public void setChatService(JDBCController jdbcController) {
         WsServerEndpoint.jdbcController = jdbcController;
+        System.out.println("成功将类的 jdbcController 注入，类的 jdbcController 为："+jdbcController);
+    }
+
+    @Autowired
+    public void InitializeMysql(){
+        jdbcController.ResetAllUserState();
+        System.out.println("The online status of all online users has been reset! ");
     }
 
 //    ================================ websocket =========================================
@@ -55,18 +63,42 @@ public class WsServerEndpoint {
         this.session =session;
         this.userid = id;
 
+        System.out.println(
+                "Received the user login request with id = " + id + " and password = " + pwd + ", and is verifying the legitimacy of the user...");
+
         //首先判断是否登陆成功，如果登陆成功，返回对应的内容
         List<Map<String, Object>> mapList = jdbcController.UserLogin(id, pwd, session);
+        JSONObject object = new JSONObject();       //用于发送数据
 
-        JSONObject object = new JSONObject();
         if(mapList.size()!=0){
-            object.put("id", userid);
-            object.put("msg", "ok");
-            sendWebsocketMessage(object.toString());
+            //检查更新用户哈希表信息
+            if (mHashMapUser.containsKey(id)){
+                object.put("id", userid);
+                object.put("cmd", "login_resp");
+                object.put("msg", "The user is already logged in and cannot be logged in again! ");
+                System.out.println("The user with id  = " + id + " and password = " + pwd + " failed to log in, the user has already logged in. ");
+                sendWebsocketMessage(object.toJSONString());
+                session.close();
+                return;
+            }
+            else {
+                object.put("id", userid);
+                object.put("cmd", "login_resp");
+                object.put("msg", "ok");
+                sendWebsocketMessage(object.toString());
+                mHashMapUser.put(id, session);
+
+                System.out.println("The user with id  = " + id + " and password = " + pwd + " has successfully logged in. ");
+            }
+
         }
         else {
             object.put("id", userid);
+            object.put("cmd", "login_resp");
             object.put("msg", "login failed!");
+            System.out.println("Login failed for user with id  = " + id + " and password = " + pwd);
+            sendWebsocketMessage(object.toJSONString());
+            session.close();
             return;
         }
 
@@ -76,38 +108,151 @@ public class WsServerEndpoint {
         object.put("userid", userid);
         object.put("username", mapList.get(0).get("username"));
         sendWebsocketMessage(object.toJSONString());
+        System.out.println("User details are: " + mapList.get(0).toString());
+
+        //更新用户信息的链表
+        mapList = jdbcController.GetUserDevs(userid);
+        Integer devid=0;
+        //删除该用户在设备在线用户链表中的内容
+        for (int i=0;i<mapList.size();i++){
+            devid = Integer.parseInt(mapList.get(i).get("devid").toString());
+            if (mHashMapDevUserOnlineList.containsKey(devid)){
+                mHashMapDevUserOnlineList.get(devid).add(session);
+            }
+        }
 
         //获取所有设备信息
         List<Map<String, Object>> lstMapuserDevs = jdbcController.GetUserDevs(userid);
+        Map<String, Object> devMap;
         object.clear();
-        Integer devid = 0;
         for (int i = 0; i<lstMapuserDevs.size(); i++){
-            devid = Integer.parseInt(lstMapuserDevs.get(i).get("devid").toString());
+            devMap = lstMapuserDevs.get(i);
+            devid = Integer.parseInt(devMap.get("devid").toString());
             object.put("devid", devid);
-            object.put("cmd", "devstate");
-            object.put("onlinestate", jdbcController.GetDevState(devid) ? "true" : "false");
+            object.put("cmd", "devinfo");
+            object.put("devname", devMap.get("devname").toString());
+            object.put("devpassword", devMap.get("devpassword").toString());
+            object.put("onlinestate", mHashMapDevs.containsKey(devid) ? "true" : "false");
             sendWebsocketMessage(object.toJSONString());
             object.clear();
         }
-
+        System.out.println("the device information was send successfully. ");
     }
 
     //连接关闭
     @OnClose
     public void onClose() {
+            //首先获取该用户的所有设备
+            List<Map<String, Object>> mapList = jdbcController.GetUserDevs(userid);
+            List<Session> sessionList;
+            Integer devid=0;
+            //删除该用户在设备在线用户链表中的内容
+            for (int i=0;i<mapList.size();i++){
+                devid = Integer.parseInt(mapList.get(i).get("devid").toString());
+                //判断该设备当前是否在线，如果在线，从该设备目前在线用户链表中删除对应的用户
+                if (mHashMapDevUserOnlineList.containsKey(devid)){
+                    sessionList = mHashMapDevUserOnlineList.get(devid);
+                    for (int j=0;j<sessionList.size();j++){
+                        if (sessionList.get(j) == session)
+                        {
+                            mHashMapDevUserOnlineList.get(devid).remove(j);
+                            break;
+                        }
+                    }
+                }
+            }
 
-        if (mHashMapUser.containsKey(userid)){
-            mHashMapUser.remove(userid);
-        }
+            //删除该用户在在线用户 map 中的位置
+            if (mHashMapUser.containsKey(userid)) {
+                mHashMapUser.remove(userid);
+            }
+            //断开连接
+            try {
+                session.close();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
 
-        System.out.println("连接关闭");
+            System.out.println("The user with id " + userid + " is offline");
     }
 
     //接收到消息
     @OnMessage
-    public String onMsg(String text, Session session) throws IOException {
+    public void onMsg(String text, Session session) throws IOException {
+        System.out.println("Received a message from the user with id = " + 1 + ", parsing the json format...");
+        JSONObject objMsgRecv = JSONObject.parseObject(text);
+        System.out.println("JSON data parsed successfully! ");
 
-        return "servet 发送：" + text;
+        JSONObject objMsgBack = new JSONObject();
+        switch (objMsgRecv.get("cmd").toString()){
+            case "resp_statequery":
+            case "state_control":
+            {
+                Integer devid = objMsgRecv.getInteger("devid");
+                String cmdResp = objMsgRecv.get("cmd").toString() == "state_query" ? "resp_query" : "resp_control";
+
+                //判断设备是否在线
+                if (mHashMapDevs.containsKey(devid)) {
+                    //判断是否有控制权限
+                    if(jdbcController.hasPermission(userid, devid)){
+                        mHashMapDevs.get(devid).handleMessage(MessageBuilder.withPayload(text).build());
+                        //返回正在查询的消息
+                        objMsgBack.put("cmd", cmdResp);
+                        objMsgBack.put("msg", "querying...");
+                        sendWebsocketMessage(objMsgBack.toJSONString());
+                        System.out.println("Querying device status information with id = " + devid);
+                    }
+                    else {
+                        //没有权限
+                        objMsgBack.put("cmd", cmdResp);
+                        objMsgBack.put("msg", "No permission! ");
+                        sendWebsocketMessage(objMsgBack.toJSONString());
+                        System.out.println(
+                                "The user with id = " + 1 + " does not have permission to control the device with device id = " + 2 + ", and the request is rejected");
+                    }
+                }
+                else {
+                    objMsgBack.put("cmd", cmdResp);
+                    objMsgBack.put("msg", "the device is offline! ");
+                    sendWebsocketMessage(objMsgBack.toJSONString());
+                    System.out.println("The device with id = " + devid + " is offline and cannot view device information! ");
+                }
+            }
+                break;
+            case "state_on":
+            case "state_off":
+            {
+                Integer devid = objMsgRecv.getInteger("devid");
+
+                //判断是否有控制权限
+                if(jdbcController.hasPermission(userid, devid)){
+                    mHashMapDevs.get(devid).handleMessage(MessageBuilder.withPayload(text).build());
+                    //返回正在查询的消息
+                    objMsgBack.put("cmd", "resp_on");
+                    objMsgBack.put("msg", "openning the device...");
+                    sendWebsocketMessage(objMsgBack.toJSONString());
+                    System.out.println("Openning the device with id = " + devid);
+                }
+                else {
+                    //没有权限
+                    objMsgBack.put("cmd", "resp_on");
+                    objMsgBack.put("msg", "No permission! ");
+                    sendWebsocketMessage(objMsgBack.toJSONString());
+                    System.out.println(
+                            "The user with id = " + 1 + " does not have permission to control the device with device id = " + 2 + ", and the request is rejected");
+                }
+            }
+                break;
+            case "info_query":
+            {
+                objMsgBack.put("cmd", "resp_infoquery");
+                objMsgBack.put("msg", "feature is under development...");
+                sendWebsocketMessage(objMsgBack.toJSONString());
+            }
+                break;
+            default:
+                break;
+        }
     }
 
     //发送消息
@@ -117,7 +262,7 @@ public class WsServerEndpoint {
 
     @OnError
     public void onError(Throwable t) {
-        System.out.println(" websocket 连接出错！");
+        System.out.println(" websocket 连接出错！出错详细信息为：");
         System.out.println(t);
     }
 //    ================================================================================
@@ -150,43 +295,75 @@ public class WsServerEndpoint {
 
         //然后解析对应的命令内容
         JSONObject jsonMsg = JSON.parseObject(new String((byte[])message.getPayload()));
-        Integer devid = jsonMsg.getInteger("id");
+        Integer devid = jsonMsg.getInteger("devid");
 
         switch (jsonMsg.get("cmd").toString())
         {
-            case "on":
+            case "dev_on":
             {
                 //为哈希表中增加对应的客户端连接的类
                 UnicastSendingMessageHandler unicastSendingMessageHandler = new UnicastSendingMessageHandler(ipAddress, port);
                 mHashMapDevs.put(devid, unicastSendingMessageHandler);
                 List<Session> sessionList = new LinkedList<>();
-                List<Map<String, Object>> mapList = jdbcController.GetDevUsersOnline(userid);
+                List<Map<String, Object>> mapList = jdbcController.GetDevUsersOnline(devid);
                 //找到对应的所有在线的用户的 session 然后保存起来
                 for( int i = 0 ; i < mapList.size() ; i++) {    //内部不锁定，效率最高，但在多线程要考虑并发操作的问题。
-                    sessionList.add(mHashMapUser.get(mapList.get(i).keySet()));
+                    sessionList.add(mHashMapUser.get(mapList.get(i).get("userid")));
                 }
                 mHashMapDevUserOnlineList.put(devid, sessionList);
+
+                //为每一个在线用户发送通知消息
+                jsonMsg.clear();
+                jsonMsg.put("cmd", "dev_state");
+                jsonMsg.put("devid", devid);
+                jsonMsg.put("onlinestate", "true");
+                for (int i=0;i<sessionList.size();i++){
+                    try {
+                        sessionList.get(i).getBasicRemote().sendText(jsonMsg.toJSONString());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
 
                 //首先获取对应的连接 ip 地址和端口
                 System.out.println("connection accepted! ");
                 System.out.println("ip: " + ipAddress);
                 System.out.println("port: " + port);
                 System.out.println("connections: " + mHashMapDevs.size());
-
-                JSONObject object = new JSONObject();
-                object.put("id", devid);
-                object.put("cmd", "on_resp");
-                sendUdpMessage(ipAddress, port, object.toJSONString());
+                jsonMsg.clear();
+                jsonMsg.clear();
+                jsonMsg.put("id", devid);
+                jsonMsg.put("cmd", "on_resp");
+                sendUdpMessage(ipAddress, port, jsonMsg.toJSONString());
+                System.out.println("The device with id = " + devid + " is online! ");
             }
                 break;
-            case "off":
+            case "dev_off":
             {
-                mHashMapDevs.remove(jsonMsg.get("id"));
-                System.out.println("The device with userid = " + userid + "is offline! ");
+                //向所有在线的用户发送提示信息
+                List<Session> sessionList = mHashMapDevUserOnlineList.get(devid);
+                jsonMsg.clear();
+                jsonMsg.put("cmd", "dev_state");
+                jsonMsg.put("devid", devid);
+                jsonMsg.put("onlinestate", "false");
+                //找到对应的所有在线的用户的 session 然后保存起来
+                for( int i = 0 ; i < sessionList.size() ; i++) {    //内部不锁定，效率最高，但在多线程要考虑并发操作的问题。
+                    try {
+                        sessionList.get(i).getBasicRemote().sendText(jsonMsg.toJSONString());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
 
+                //清理对应的哈希表内容
+                if (mHashMapDevs.containsKey(devid))
+                    mHashMapDevs.remove(devid);
+                if(mHashMapDevUserOnlineList.containsKey(devid))
+                    mHashMapDevUserOnlineList.remove(devid);
+                System.out.println("The device with id = " + devid + "is offline! ");
             }
                 break;
-            case "heart_beat":
+            case "dev_heartbeat":
             {
                 JSONObject object = new JSONObject();
                 object.put("id", devid);
@@ -195,19 +372,19 @@ public class WsServerEndpoint {
                 System.out.println("Receive a heartbeat packet with userid = " + userid);
             }
                 break;
-            case "state_ack":
+            case "dev_ack":
             {
                 //首先查询对应的 userid 是谁的查询内容
                 Integer userid = jsonMsg.getInteger("userid");
                 try {
-                    mHashMapUser.get(userid).getBasicRemote().sendText(message.toString());
+                    session.getBasicRemote().sendText(message.toString());
                     System.out.println("Device details have been sent to user with userid = " + this.userid);
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             }
                 break;
-            case "state_chg":
+            case "dev_chg":
             {
                 //首先查询对应的 userid 是谁的查询内容
                 List<Session> sessionList = mHashMapDevUserOnlineList.get(devid);
